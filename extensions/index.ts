@@ -11,7 +11,8 @@
  *
  * Prerequisites:
  *   uv tool install arcgeneral          # or pip install arcgeneral
- *   export OPENROUTER_API_KEY=...       # or provider-specific key
+ *   # API key is bridged automatically when Pi uses Anthropic (including OAuth login).
+ *   # For OpenRouter: export OPENROUTER_API_KEY=...
  */
 
 import { spawn } from "node:child_process";
@@ -149,6 +150,7 @@ async function runArcgeneral(opts: {
 	cwd: string;
 	signal?: AbortSignal;
 	timeout?: number;
+	apiKey?: string;
 }): Promise<ArcgeneralResult> {
 	const bin = resolveArcgeneralBin();
 	const args: string[] = ["--json"];
@@ -170,7 +172,7 @@ async function runArcgeneral(opts: {
 			cwd: opts.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env },
+			env: { ...process.env, ...(opts.apiKey ? { ANTHROPIC_API_KEY: opts.apiKey } : {}) },
 		});
 
 		let stdout = "";
@@ -325,7 +327,32 @@ The agent runs in its own IPython environment with access to the working directo
 
 The task prompt must be self-contained. The agent cannot see your conversation unless you set context=true.`;
 
+	// ─── LLM config resolution ──────────────────────────────────────
+	// Resolve LLM provider and API key from Pi's model registry.
+	// When Pi is using Anthropic (including OAuth login), bridge the key
+	// so arcgeneral uses its native AnthropicClient with stealth mode.
+	async function resolveLLMConfig(ctx: ExtensionContext): Promise<{
+		provider?: string;
+		apiKey?: string;
+		model?: string;
+	}> {
+		const model = ctx.model;
+		if (!model) return {};
+		if (model.provider === "anthropic") {
+			const apiKey = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
+			return {
+				provider: "anthropic",
+				apiKey: apiKey ?? undefined,
+				model: model.id,
+			};
+		}
+		// For non-Anthropic providers, arcgeneral uses OpenRouter (its default).
+		// The user's OPENROUTER_API_KEY from process.env is inherited automatically.
+		return {};
+	}
+
 	// ─── Register the arcgeneral tool ────────────────────────────────
+
 	pi.registerTool({
 		name: "arcgeneral",
 		label: "Arcgeneral",
@@ -336,12 +363,14 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 			const contextMessages = params.context
 				? extractConversationContext(ctx)
 				: undefined;
-
+			const llmConfig = await resolveLLMConfig(ctx);
 			const result = await runArcgeneral({
 				task: params.task,
 				context: params.context,
 				contextMessages,
-				model: params.model,
+				model: params.model ?? llmConfig.model,
+				provider: llmConfig.provider,
+				apiKey: llmConfig.apiKey,
 				functions: params.functions,
 				cwd: ctx.cwd,
 				signal,
@@ -375,13 +404,16 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 
 			ctx.ui.notify("Delegating to arcgeneral...", "info");
 
-			// Bridge the conversation context
+			// Bridge the conversation context and LLM config
 			const contextMessages = extractConversationContext(ctx);
-
+			const llmConfig = await resolveLLMConfig(ctx);
 			const result = await runArcgeneral({
 				task,
 				context: true,
 				contextMessages,
+				provider: llmConfig.provider,
+				model: llmConfig.model,
+				apiKey: llmConfig.apiKey,
 				cwd: ctx.cwd,
 			});
 
