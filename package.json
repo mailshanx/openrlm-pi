@@ -1,0 +1,15 @@
+{
+  "name": "arcgeneral-pi",
+  "version": "0.1.0",
+  "description": "Pi extension and skill for arcgeneral — a recursive LLM agent with persistent IPython REPL",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  }
+}
