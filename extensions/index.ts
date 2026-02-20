@@ -108,6 +108,18 @@ function writeContextFile(
 	return filePath;
 }
 
+/**
+ * Write an API key to a file atomically (write tmp + rename).
+ * Returns the file path on first call, reuses same path on subsequent calls.
+ */
+function writeTokenFile(dir: string, token: string): string {
+	const filePath = path.join(dir, "token");
+	const tmpPath = filePath + ".tmp";
+	fs.writeFileSync(tmpPath, token, { encoding: "utf-8", mode: 0o600 });
+	fs.renameSync(tmpPath, filePath);
+	return filePath;
+}
+
 // ─── Output truncation ──────────────────────────────────────────────────
 
 function truncateOutput(text: string): { text: string; truncated: boolean } {
@@ -151,6 +163,7 @@ async function runArcgeneral(opts: {
 	signal?: AbortSignal;
 	timeout?: number;
 	apiKey?: string;
+	tokenRefresher?: () => Promise<string | undefined>;
 }): Promise<ArcgeneralResult> {
 	const bin = resolveArcgeneralBin();
 	const args: string[] = ["--json"];
@@ -166,13 +179,40 @@ async function runArcgeneral(opts: {
 	}
 
 	args.push(opts.task);
+	let tokenFile: string | null = null;
+	let tokenDir: string | null = null;
+	let refreshInterval: ReturnType<typeof setInterval> | null = null;
+	const envOverrides: Record<string, string> = {};
+
+	if (opts.tokenRefresher) {
+		const initialToken = await opts.tokenRefresher();
+		if (initialToken) {
+			tokenDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-arcgeneral-token-"));
+			fs.chmodSync(tokenDir, 0o700);
+			tokenFile = writeTokenFile(tokenDir, initialToken);
+			// Set both: ARCGENERAL_TOKEN_FILE for live refresh, ANTHROPIC_API_KEY for initial
+			envOverrides.ARCGENERAL_TOKEN_FILE = tokenFile;
+			envOverrides.ANTHROPIC_API_KEY = initialToken;
+
+			refreshInterval = setInterval(async () => {
+				try {
+					const newToken = await opts.tokenRefresher!();
+					if (newToken && tokenFile) {
+						writeTokenFile(path.dirname(tokenFile), newToken);
+					}
+				} catch { /* refresh failed, subprocess keeps using last good token */ }
+			}, 240_000);
+		}
+	} else if (opts.apiKey) {
+		envOverrides.ANTHROPIC_API_KEY = opts.apiKey;
+	}
 
 	return new Promise<ArcgeneralResult>((resolve) => {
 		const proc = spawn(bin, args, {
 			cwd: opts.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, ...(opts.apiKey ? { ANTHROPIC_API_KEY: opts.apiKey } : {}) },
+			env: { ...process.env, ...envOverrides },
 		});
 
 		let stdout = "";
@@ -189,9 +229,21 @@ async function runArcgeneral(opts: {
 		});
 
 		const cleanup = () => {
+			if (refreshInterval) {
+				clearInterval(refreshInterval);
+				refreshInterval = null;
+			}
 			if (contextFile) {
 				try { fs.unlinkSync(contextFile); } catch { /* ignore */ }
 				try { fs.rmdirSync(path.dirname(contextFile)); } catch { /* ignore */ }
+			}
+			if (tokenFile) {
+				try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
+				const tmpPath = tokenFile + ".tmp";
+				try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+			}
+			if (tokenDir) {
+				try { fs.rmdirSync(tokenDir); } catch { /* ignore */ }
 			}
 		};
 
@@ -328,21 +380,20 @@ The agent runs in its own IPython environment with access to the working directo
 The task prompt must be self-contained. The agent cannot see your conversation unless you set context=true.`;
 
 	// ─── LLM config resolution ──────────────────────────────────────
-	// Resolve LLM provider and API key from Pi's model registry.
+	// Resolve LLM provider and token refresher from Pi's model registry.
 	// When Pi is using Anthropic (including OAuth login), bridge the key
 	// so arcgeneral uses its native AnthropicClient with stealth mode.
 	async function resolveLLMConfig(ctx: ExtensionContext): Promise<{
 		provider?: string;
-		apiKey?: string;
+		tokenRefresher?: () => Promise<string | undefined>;
 		model?: string;
 	}> {
 		const model = ctx.model;
 		if (!model) return {};
 		if (model.provider === "anthropic") {
-			const apiKey = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
 			return {
 				provider: "anthropic",
-				apiKey: apiKey ?? undefined,
+				tokenRefresher: () => ctx.modelRegistry.getApiKeyForProvider("anthropic"),
 				model: model.id,
 			};
 		}
@@ -370,7 +421,7 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 				contextMessages,
 				model: params.model ?? llmConfig.model,
 				provider: llmConfig.provider,
-				apiKey: llmConfig.apiKey,
+				tokenRefresher: llmConfig.tokenRefresher,
 				functions: params.functions,
 				cwd: ctx.cwd,
 				signal,
@@ -413,7 +464,7 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 				contextMessages,
 				provider: llmConfig.provider,
 				model: llmConfig.model,
-				apiKey: llmConfig.apiKey,
+				tokenRefresher: llmConfig.tokenRefresher,
 				cwd: ctx.cwd,
 			});
 
