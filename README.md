@@ -66,19 +66,19 @@ The LLM will use the `arcgeneral` tool when it determines a task benefits from a
 
 ```json
 {
-  "task": "Load data.csv, fit a linear regression of price vs. volume, report R² and coefficients, plot residuals to residuals.png",
-  "context": false
+	"task": "Load data.csv, fit a linear regression of price vs. volume, report R² and coefficients, plot residuals to residuals.png",
+	"context": false
 }
 ```
 
 ### Parameters
 
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `task` | Yes | Self-contained task description with file paths and expected output |
-| `context` | No | Include conversation history from the current pi session (default: false) |
-| `model` | No | Override the LLM model (e.g. `anthropic/claude-sonnet-4-5`) |
-| `functions` | No | Comma-separated host function modules to load (e.g. `./contrib`) |
+| Parameter   | Required | Description                                                               |
+| ----------- | -------- | ------------------------------------------------------------------------- |
+| `task`      | Yes      | Self-contained task description with file paths and expected output       |
+| `context`   | No       | Include conversation history from the current pi session (default: false) |
+| `model`     | No       | Override the LLM model (e.g. `anthropic/claude-sonnet-4-5`)               |
+| `functions` | No       | Comma-separated host function modules to load (e.g. `./contrib`)          |
 
 ## How it works
 
