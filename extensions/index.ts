@@ -196,6 +196,112 @@ interface ArcgeneralResult {
 	stderr: string;
 }
 
+interface AgentNode {
+	parentId: string;
+	depth: number;
+	status: "idle" | "running" | "done";
+	round: number;
+	maxRounds: number;
+}
+
+class AgentTree {
+	private agents = new Map<string, AgentNode>();
+	private lastActiveId = "main";
+
+	handleEvent(event: { type: string; [key: string]: unknown }): void {
+		const id = event.agent_id as string;
+		switch (event.type) {
+			case "AgentCreated":
+				this.agents.set(id, {
+					parentId: event.parent_id as string,
+					depth: event.depth as number,
+					status: "idle",
+					round: 0,
+					maxRounds: 0,
+				});
+				break;
+			case "TaskStarted": {
+				const node = this.agents.get(id);
+				if (node) node.status = "running";
+				break;
+			}
+			case "RoundStart": {
+				if (!this.agents.has(id)) {
+					this.agents.set(id, { parentId: "", depth: 0, status: "running", round: 0, maxRounds: 0 });
+				}
+				const node = this.agents.get(id)!;
+				node.round = (event.round_num as number) + 1;
+				node.maxRounds = event.max_rounds as number;
+				node.status = "running";
+				this.lastActiveId = id;
+				break;
+			}
+			case "TaskCompleted": {
+				const node = this.agents.get(id);
+				if (node) node.status = "done";
+				break;
+			}
+		}
+	}
+
+	hasSubAgents(): boolean {
+		return this.agents.size > 1;
+	}
+
+	renderStatus(): string {
+		const active = this.agents.get(this.lastActiveId);
+		if (!active) return "arcgeneral: starting...";
+		const total = this.agents.size;
+		return total <= 1
+			? `arcgeneral: round ${active.round}/${active.maxRounds}`
+			: `arcgeneral: ${total} agents, round ${active.round}/${active.maxRounds}`;
+	}
+
+	renderTree(): string[] {
+		const children = new Map<string, string[]>();
+		let rootId: string | undefined;
+		for (const [id, node] of this.agents) {
+			if (node.parentId === "") {
+				rootId = id;
+			} else {
+				const siblings = children.get(node.parentId);
+				if (siblings) siblings.push(id);
+				else children.set(node.parentId, [id]);
+			}
+		}
+		if (!rootId) return [];
+
+		const lines: string[] = [];
+
+		const formatStatus = (node: AgentNode): string => {
+			switch (node.status) {
+				case "running":
+					return `round ${node.round}/${node.maxRounds}`;
+				case "idle":
+					return "waiting";
+				case "done":
+					return "done";
+			}
+		};
+
+		const walk = (id: string, prefix: string, isLast: boolean, isRoot: boolean) => {
+			const node = this.agents.get(id)!;
+			const connector = isRoot ? "" : isLast ? "└─ " : "├─ ";
+			const label = isRoot ? id : id.slice(0, 8);
+			lines.push(`${prefix}${connector}${label}  ${formatStatus(node)}`);
+
+			const kids = children.get(id) ?? [];
+			const childPrefix = isRoot ? "" : prefix + (isLast ? "   " : "│  ");
+			for (let i = 0; i < kids.length; i++) {
+				walk(kids[i], childPrefix, i === kids.length - 1, false);
+			}
+		};
+
+		walk(rootId, "", true, true);
+		return lines;
+	}
+}
+
 async function runArcgeneral(opts: {
 	task: string;
 	context?: boolean;
@@ -488,8 +594,7 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 			// Bridge the conversation context and LLM config
 			const contextMessages = extractConversationContext(ctx);
 			const llmConfig = await resolveLLMConfig(ctx);
-			const agents = new Map<string, { parentId: string; depth: number; status: "idle" | "running" | "done"; round: number; maxRounds: number }>();
-			let lastActiveId = "main";
+			const tree = new AgentTree();
 			ctx.ui.setStatus("arcgeneral", "arcgeneral: starting...");
 			const result = await runArcgeneral({
 				task,
@@ -500,42 +605,15 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 				tokenRefresher: llmConfig.tokenRefresher,
 				cwd: ctx.cwd,
 				onEvent(event) {
-					const id = event.agent_id as string;
-					if (event.type === "AgentCreated") {
-						agents.set(id, {
-							parentId: event.parent_id as string,
-							depth: event.depth as number,
-							status: "idle",
-							round: 0,
-							maxRounds: 0,
-						});
-					} else if (event.type === "TaskStarted") {
-						const node = agents.get(id);
-						if (node) node.status = "running";
-					} else if (event.type === "RoundStart") {
-						if (!agents.has(id)) {
-							agents.set(id, { parentId: "", depth: 0, status: "running", round: 0, maxRounds: 0 });
-						}
-						const node = agents.get(id)!;
-						node.round = (event.round_num as number) + 1;
-						node.maxRounds = event.max_rounds as number;
-						node.status = "running";
-						lastActiveId = id;
-					} else if (event.type === "TaskCompleted") {
-						const node = agents.get(id);
-						if (node) node.status = "done";
+					tree.handleEvent(event);
+					ctx.ui.setStatus("arcgeneral", tree.renderStatus());
+					if (tree.hasSubAgents()) {
+						ctx.ui.setWidget("arcgeneral", tree.renderTree(), { placement: "belowEditor" });
 					}
-
-					const active = agents.get(lastActiveId);
-					if (!active) return;
-					const total = agents.size;
-					const status = total <= 1
-						? `arcgeneral: round ${active.round}/${active.maxRounds}`
-						: `arcgeneral: ${total} agents, round ${active.round}/${active.maxRounds}`;
-					ctx.ui.setStatus("arcgeneral", status);
 				},
 			});
 			ctx.ui.setStatus("arcgeneral", undefined);
+			ctx.ui.setWidget("arcgeneral", undefined);
 
 			if (result.error) {
 				pi.sendMessage({
