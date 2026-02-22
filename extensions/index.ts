@@ -488,8 +488,8 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 			// Bridge the conversation context and LLM config
 			const contextMessages = extractConversationContext(ctx);
 			const llmConfig = await resolveLLMConfig(ctx);
-			const agentsSeen = new Set<string>();
-
+			const agents = new Map<string, { parentId: string; depth: number; status: "idle" | "running" | "done"; round: number; maxRounds: number }>();
+			let lastActiveId = "main";
 			ctx.ui.setStatus("arcgeneral", "arcgeneral: starting...");
 			const result = await runArcgeneral({
 				task,
@@ -500,15 +500,39 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 				tokenRefresher: llmConfig.tokenRefresher,
 				cwd: ctx.cwd,
 				onEvent(event) {
-					if (event.type === "RoundStart") {
-						agentsSeen.add(event.agent_id as string);
-						const round = (event.round_num as number) + 1;
-						const max = event.max_rounds as number;
-						const status = agentsSeen.size > 1
-							? `arcgeneral: ${agentsSeen.size} agents, ${event.agent_id} round ${round}/${max}`
-							: `arcgeneral: round ${round}/${max}`;
-						ctx.ui.setStatus("arcgeneral", status);
+					const id = event.agent_id as string;
+					if (event.type === "AgentCreated") {
+						agents.set(id, {
+							parentId: event.parent_id as string,
+							depth: event.depth as number,
+							status: "idle",
+							round: 0,
+							maxRounds: 0,
+						});
+					} else if (event.type === "TaskStarted") {
+						const node = agents.get(id);
+						if (node) node.status = "running";
+					} else if (event.type === "RoundStart") {
+						if (!agents.has(id)) {
+							agents.set(id, { parentId: "", depth: 0, status: "running", round: 0, maxRounds: 0 });
+						}
+						const node = agents.get(id)!;
+						node.round = (event.round_num as number) + 1;
+						node.maxRounds = event.max_rounds as number;
+						node.status = "running";
+						lastActiveId = id;
+					} else if (event.type === "TaskCompleted") {
+						const node = agents.get(id);
+						if (node) node.status = "done";
 					}
+
+					const active = agents.get(lastActiveId);
+					if (!active) return;
+					const total = agents.size;
+					const status = total <= 1
+						? `arcgeneral: round ${active.round}/${active.maxRounds}`
+						: `arcgeneral: ${total} agents, round ${active.round}/${active.maxRounds}`;
+					ctx.ui.setStatus("arcgeneral", status);
 				},
 			});
 			ctx.ui.setStatus("arcgeneral", undefined);
