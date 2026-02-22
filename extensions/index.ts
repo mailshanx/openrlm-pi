@@ -55,9 +55,7 @@ function resolveArcgeneralBin(): string {
  * Drops tool messages, system messages, and other entry types.
  * Returns a JSON-serializable array for arcgeneral's --context flag.
  */
-function extractConversationContext(
-	ctx: ExtensionContext,
-): Array<{ role: "user" | "assistant"; content: string }> {
+function extractConversationContext(ctx: ExtensionContext): Array<{ role: "user" | "assistant"; content: string }> {
 	const messages: Array<{ role: "user" | "assistant"; content: string }> = [];
 	let count = 0;
 
@@ -99,25 +97,71 @@ function extractConversationContext(
  * Write context messages to a temp file and return the path.
  * Caller is responsible for cleanup.
  */
-function writeContextFile(
-	messages: Array<{ role: string; content: string }>,
-): string {
+function writeContextFile(messages: Array<{ role: string; content: string }>): string {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-arcgeneral-"));
 	const filePath = path.join(tmpDir, "context.json");
 	fs.writeFileSync(filePath, JSON.stringify(messages), "utf-8");
 	return filePath;
 }
 
+// ─── Auth file management ─────────────────────────────────────────────────
+
+const ARCGENERAL_AUTH_DIR = path.join(os.homedir(), ".arcgeneral");
+const ARCGENERAL_AUTH_FILE = path.join(ARCGENERAL_AUTH_DIR, "auth.json");
+
 /**
- * Write an API key to a file atomically (write tmp + rename).
- * Returns the file path on first call, reuses same path on subsequent calls.
+ * Write a provider's API key to ~/.arcgeneral/auth.json atomically.
+ * Merges with existing entries so other providers are preserved.
  */
-function writeTokenFile(dir: string, token: string): string {
-	const filePath = path.join(dir, "token");
-	const tmpPath = filePath + ".tmp";
-	fs.writeFileSync(tmpPath, token, { encoding: "utf-8", mode: 0o600 });
-	fs.renameSync(tmpPath, filePath);
-	return filePath;
+function writeAuthFile(provider: string, token: string): void {
+	// Ensure directory exists
+	if (!fs.existsSync(ARCGENERAL_AUTH_DIR)) {
+		fs.mkdirSync(ARCGENERAL_AUTH_DIR, { recursive: true, mode: 0o700 });
+	}
+
+	// Read existing entries
+	let data: Record<string, string> = {};
+	try {
+		data = JSON.parse(fs.readFileSync(ARCGENERAL_AUTH_FILE, "utf-8"));
+	} catch {
+		/* file missing or invalid — start fresh */
+	}
+
+	data[provider] = token;
+
+	// Atomic write: tmp + rename
+	const tmpPath = ARCGENERAL_AUTH_FILE + ".tmp";
+	fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
+	fs.renameSync(tmpPath, ARCGENERAL_AUTH_FILE);
+}
+
+/**
+ * Remove a provider's entry from ~/.arcgeneral/auth.json.
+ * Called on cleanup so stale tokens don't persist.
+ */
+function removeAuthEntry(provider: string): void {
+	try {
+		const data = JSON.parse(fs.readFileSync(ARCGENERAL_AUTH_FILE, "utf-8"));
+		delete data[provider];
+		if (Object.keys(data).length === 0) {
+			try {
+				fs.unlinkSync(ARCGENERAL_AUTH_FILE);
+			} catch {
+				/* ignore */
+			}
+			try {
+				fs.unlinkSync(ARCGENERAL_AUTH_FILE + ".tmp");
+			} catch {
+				/* ignore */
+			}
+		} else {
+			const tmpPath = ARCGENERAL_AUTH_FILE + ".tmp";
+			fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
+			fs.renameSync(tmpPath, ARCGENERAL_AUTH_FILE);
+		}
+	} catch {
+		/* ignore — file missing or invalid */
+	}
 }
 
 // ─── Output truncation ──────────────────────────────────────────────────
@@ -158,19 +202,17 @@ async function runArcgeneral(opts: {
 	contextMessages?: Array<{ role: string; content: string }>;
 	model?: string;
 	provider?: string;
-	functions?: string;
 	cwd: string;
 	signal?: AbortSignal;
 	timeout?: number;
-	apiKey?: string;
 	tokenRefresher?: () => Promise<string | undefined>;
+	onEvent?: (event: { type: string; [key: string]: unknown }) => void;
 }): Promise<ArcgeneralResult> {
 	const bin = resolveArcgeneralBin();
 	const args: string[] = ["--json"];
 
 	if (opts.model) args.push("--model", opts.model);
 	if (opts.provider) args.push("--provider", opts.provider);
-	if (opts.functions) args.push("--functions", opts.functions);
 
 	let contextFile: string | null = null;
 	if (opts.context && opts.contextMessages && opts.contextMessages.length > 0) {
@@ -179,32 +221,30 @@ async function runArcgeneral(opts: {
 	}
 
 	args.push(opts.task);
-	let tokenFile: string | null = null;
-	let tokenDir: string | null = null;
+	let authProvider: string | null = null;
 	let refreshInterval: ReturnType<typeof setInterval> | null = null;
-	const envOverrides: Record<string, string> = {};
-
-	if (opts.tokenRefresher) {
+	if (opts.tokenRefresher && opts.provider) {
 		const initialToken = await opts.tokenRefresher();
-		if (initialToken) {
-			tokenDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-arcgeneral-token-"));
-			fs.chmodSync(tokenDir, 0o700);
-			tokenFile = writeTokenFile(tokenDir, initialToken);
-			// Set both: ARCGENERAL_TOKEN_FILE for live refresh, ANTHROPIC_API_KEY for initial
-			envOverrides.ARCGENERAL_TOKEN_FILE = tokenFile;
-			envOverrides.ANTHROPIC_API_KEY = initialToken;
-
-			refreshInterval = setInterval(async () => {
-				try {
-					const newToken = await opts.tokenRefresher!();
-					if (newToken && tokenFile) {
-						writeTokenFile(path.dirname(tokenFile), newToken);
-					}
-				} catch { /* refresh failed, subprocess keeps using last good token */ }
-			}, 240_000);
+		if (!initialToken) {
+			return {
+				result: null,
+				error: `Could not obtain API key for ${opts.provider}. Check your login status or set the appropriate environment variable.`,
+				exitCode: 1,
+				stderr: "",
+			};
 		}
-	} else if (opts.apiKey) {
-		envOverrides.ANTHROPIC_API_KEY = opts.apiKey;
+		authProvider = opts.provider;
+		writeAuthFile(authProvider, initialToken);
+		refreshInterval = setInterval(async () => {
+			try {
+				const newToken = await opts.tokenRefresher!();
+				if (newToken && authProvider) {
+					writeAuthFile(authProvider, newToken);
+				}
+			} catch {
+				/* refresh failed, subprocess keeps using last good token */
+			}
+		}, 240_000);
 	}
 
 	return new Promise<ArcgeneralResult>((resolve) => {
@@ -212,7 +252,7 @@ async function runArcgeneral(opts: {
 			cwd: opts.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, ...envOverrides },
+			env: process.env,
 		});
 
 		let stdout = "";
@@ -225,7 +265,19 @@ async function runArcgeneral(opts: {
 		});
 
 		proc.stderr.on("data", (data) => {
-			stderr += data.toString();
+			for (const line of data.toString().split("\n")) {
+				if (!line) continue;
+				try {
+					const event = JSON.parse(line);
+					if (event.type && opts.onEvent) {
+						opts.onEvent(event);
+					} else {
+						stderr += line + "\n";
+					}
+				} catch {
+					stderr += line + "\n";
+				}
+			}
 		});
 
 		const cleanup = () => {
@@ -233,17 +285,20 @@ async function runArcgeneral(opts: {
 				clearInterval(refreshInterval);
 				refreshInterval = null;
 			}
+			if (authProvider) {
+				removeAuthEntry(authProvider);
+			}
 			if (contextFile) {
-				try { fs.unlinkSync(contextFile); } catch { /* ignore */ }
-				try { fs.rmdirSync(path.dirname(contextFile)); } catch { /* ignore */ }
-			}
-			if (tokenFile) {
-				try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
-				const tmpPath = tokenFile + ".tmp";
-				try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-			}
-			if (tokenDir) {
-				try { fs.rmdirSync(tokenDir); } catch { /* ignore */ }
+				try {
+					fs.unlinkSync(contextFile);
+				} catch {
+					/* ignore */
+				}
+				try {
+					fs.rmdirSync(path.dirname(contextFile));
+				} catch {
+					/* ignore */
+				}
 			}
 		};
 
@@ -265,7 +320,7 @@ async function runArcgeneral(opts: {
 				// JSON parse failed — raw output
 				resolve({
 					result: stdout.trim() || null,
-					error: code !== 0 ? (stderr.trim() || `Process exited with code ${code}`) : null,
+					error: code !== 0 ? stderr.trim() || `Process exited with code ${code}` : null,
 					exitCode: code ?? 1,
 					stderr,
 				});
@@ -295,13 +350,17 @@ async function runArcgeneral(opts: {
 		});
 
 		// Timeout
-		const timeoutMs = (opts.timeout ?? 300) * 1000;
+		const timeoutMs = (opts.timeout ?? 3600) * 1000;
 		const timer = setTimeout(() => {
 			if (!hasExited) {
 				proc.kill("SIGTERM");
 				killTimer = setTimeout(() => {
 					if (!hasExited) {
-						try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+						try {
+							proc.kill("SIGKILL");
+						} catch {
+							/* already dead */
+						}
 					}
 				}, 5000);
 			}
@@ -316,7 +375,11 @@ async function runArcgeneral(opts: {
 					proc.kill("SIGTERM");
 					killTimer = setTimeout(() => {
 						if (!hasExited) {
-							try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+							try {
+								proc.kill("SIGKILL");
+							} catch {
+								/* already dead */
+							}
 						}
 					}, 5000);
 				}
@@ -331,7 +394,8 @@ async function runArcgeneral(opts: {
 
 const ArcgeneralParams = Type.Object({
 	task: Type.String({
-		description: "The task to delegate. Must be self-contained — include all necessary context, file paths, and expected output format.",
+		description:
+			"The task to delegate. Must be self-contained — include all necessary context, file paths, and expected output format.",
 	}),
 	context: Type.Optional(
 		Type.Boolean({
@@ -341,42 +405,15 @@ const ArcgeneralParams = Type.Object({
 				"task references prior conversation. Default: false.",
 		}),
 	),
-	model: Type.Optional(
-		Type.String({
-			description:
-				"Override the model for this task (e.g. 'anthropic/claude-sonnet-4-5'). " +
-				"Defaults to the arcgeneral configured default.",
-		}),
-	),
-	functions: Type.Optional(
-		Type.String({
-			description:
-				"Comma-separated list of host function modules to load " +
-				"(e.g. './contrib' for internet search/extract).",
-		}),
-	),
 });
 
 // ─── Extension entry point ──────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	const toolDescription = `Delegate a task to an arcgeneral agent — a recursive LLM agent with a persistent IPython REPL.
+	const toolDescription = `Delegate a task to an arcgeneral agent - a recursive LLM agent with a persistent IPython REPL.
+Use this tool for complex tasks that require deep, extended work - especially when the task would consume too much context window if done inline. Arcgeneral handles arbitrarily long contexts by working recursively, decomposing problems and managing its own context across rounds.
 
-Use this tool when the task involves:
-- Data analysis, computation, or statistical work on files
-- Multi-step processing that benefits from persistent variables across steps
-- Tasks requiring Python packages (numpy, pandas, matplotlib, etc.)
-- Complex file transformations or batch operations
-- Problems that benefit from recursive sub-agent decomposition
-- Any task where a stateful REPL (variables, imports, computed results persist) is advantageous
-
-Do NOT use this tool for:
-- Simple file reads, greps, or edits — use the built-in tools directly
-- Tasks that don't need computation or a REPL environment
-- Questions you can answer from context without running code
-
-The agent runs in its own IPython environment with access to the working directory. It can install packages, define functions, and persist state across multiple internal tool rounds. It returns a final text result.
-
+Use subagents for simpler tasks that fit comfortably in a single context window.
 The task prompt must be self-contained. The agent cannot see your conversation unless you set context=true.`;
 
 	// ─── LLM config resolution ──────────────────────────────────────
@@ -411,34 +448,29 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 		parameters: ArcgeneralParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const contextMessages = params.context
-				? extractConversationContext(ctx)
-				: undefined;
+			const contextMessages = params.context ? extractConversationContext(ctx) : undefined;
 			const llmConfig = await resolveLLMConfig(ctx);
 			const result = await runArcgeneral({
 				task: params.task,
 				context: params.context,
 				contextMessages,
-				model: params.model ?? llmConfig.model,
+				model: llmConfig.model,
 				provider: llmConfig.provider,
 				tokenRefresher: llmConfig.tokenRefresher,
-				functions: params.functions,
 				cwd: ctx.cwd,
 				signal,
 			});
 
 			if (result.error) {
-				return {
-					content: [{ type: "text", text: `Error: ${result.error}` }],
-					isError: true,
-				};
+				throw new Error(result.error);
 			}
 
 			const output = result.result || "(no output)";
 			const { text } = truncateOutput(output);
 
 			return {
-				content: [{ type: "text", text }],
+				content: [{ type: "text" as const, text }],
+				details: undefined as unknown,
 			};
 		},
 	});
@@ -453,11 +485,12 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 				return;
 			}
 
-			ctx.ui.notify("Delegating to arcgeneral...", "info");
-
 			// Bridge the conversation context and LLM config
 			const contextMessages = extractConversationContext(ctx);
 			const llmConfig = await resolveLLMConfig(ctx);
+			const agentsSeen = new Set<string>();
+
+			ctx.ui.setStatus("arcgeneral", "arcgeneral: starting...");
 			const result = await runArcgeneral({
 				task,
 				context: true,
@@ -466,13 +499,25 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 				model: llmConfig.model,
 				tokenRefresher: llmConfig.tokenRefresher,
 				cwd: ctx.cwd,
+				onEvent(event) {
+					if (event.type === "RoundStart") {
+						agentsSeen.add(event.agent_id as string);
+						const round = (event.round_num as number) + 1;
+						const max = event.max_rounds as number;
+						const status = agentsSeen.size > 1
+							? `arcgeneral: ${agentsSeen.size} agents, ${event.agent_id} round ${round}/${max}`
+							: `arcgeneral: round ${round}/${max}`;
+						ctx.ui.setStatus("arcgeneral", status);
+					}
+				},
 			});
+			ctx.ui.setStatus("arcgeneral", undefined);
 
 			if (result.error) {
 				pi.sendMessage({
 					customType: "arcgeneral-result",
 					content: `arcgeneral error: ${result.error}`,
-					display: "block",
+					display: true,
 				});
 			} else {
 				const output = result.result || "(no output)";
@@ -480,10 +525,7 @@ The task prompt must be self-contained. The agent cannot see your conversation u
 
 				// Inject the result back into the conversation as a steer message
 				// so the LLM sees it and can summarize/act on it.
-				pi.sendUserMessage(
-					`[arcgeneral result for task: "${task}"]\n\n${text}`,
-					{ deliverAs: "steer" },
-				);
+				pi.sendUserMessage(`[arcgeneral result for task: "${task}"]\n\n${text}`, { deliverAs: "steer" });
 			}
 		},
 	});
