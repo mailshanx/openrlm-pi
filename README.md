@@ -1,96 +1,82 @@
-# arcgeneral-pi
+# openrlm-pi
 
-[Pi](https://github.com/mariozechner/pi-coding-agent) extension and skill for [arcgeneral](https://github.com/user/arcgeneral) — a recursive LLM agent with persistent IPython REPL.
+[Pi](https://github.com/mariozechner/pi-coding-agent) extension for [openrlm](https://github.com/user/openrlm) — a recursive LLM agent with a persistent IPython REPL.
 
-## What it does
+## What it provides
 
-**`arcgeneral` tool** — the LLM can autonomously delegate tasks to an arcgeneral agent when they involve data analysis, multi-step computation, or anything that benefits from a stateful Python REPL. The agent runs in its own IPython environment, persists variables across steps, can install packages, and supports recursive sub-agent decomposition.
-
-**`/task` command** — you can explicitly delegate a task from the command line. Conversation context from the current pi session is bridged automatically.
-
-**`arcgeneral` skill** — teaches the LLM when to prefer the `arcgeneral` tool over built-in tools (data analysis, persistent state, package installation, recursive decomposition).
+- **`openrlm` tool**: lets the model delegate complex tasks to an `openrlm` subprocess.
+- **`/task` command**: lets the user explicitly delegate a task from the Pi prompt.
 
 ## Install
 
-Requires [arcgeneral](https://github.com/user/arcgeneral) on the system:
+Requires [openrlm](https://github.com/user/openrlm):
 
 ```bash
-pip install arcgeneral
+pip install openrlm
 # or
-uv tool install arcgeneral
+uv tool install openrlm
 ```
 
-Then install this package into pi:
+Install this package into Pi:
 
 ```bash
 # From git
-pi install git:github.com/user/arcgeneral-pi
+pi install git:github.com/user/openrlm-pi
 
-# From a local checkout
-pi install /path/to/arcgeneral-pi
+# From local checkout
+pi install /path/to/openrlm-pi
 
-# Try without installing
-pi -e ./extensions/arcgeneral.ts
+# Run directly without installing
+pi -e ./extensions
 ```
 
-## Configuration
+## Auth behavior
 
-Set an API key for the LLM provider arcgeneral will use:
+- Default path: `openrlm` uses your normal provider env vars (for example `OPENROUTER_API_KEY`).
+- If Pi is currently using `anthropic` or `openai-codex`, this extension bridges Pi's active access token to `openrlm` for that invocation.
+- Pi remains the OAuth authority (login + refresh). The extension only provides a temporary per-run auth file through `OPENRLM_AUTH_FILE`.
 
-```bash
-export OPENROUTER_API_KEY=...   # default provider
-# or provider-specific:
-export ANTHROPIC_API_KEY=...
-export OPENAI_API_KEY=...
-```
-
-Optionally override the binary location:
+Optional binary override:
 
 ```bash
-export ARCGENERAL_BIN=/path/to/arcgeneral
+export OPENRLM_BIN=/path/to/openrlm
 ```
 
 ## Usage
 
-### Autonomous (LLM decides)
-
-The LLM will use the `arcgeneral` tool when it determines a task benefits from a persistent REPL. The skill provides guidance on when this is appropriate.
-
-### Explicit (user delegates)
-
-```
-/task Load sales.csv, compute monthly revenue by product category, and save a summary to analysis.md
-```
-
-### From LLM tool call
+### Tool call
 
 ```json
 {
-	"task": "Load data.csv, fit a linear regression of price vs. volume, report R² and coefficients, plot residuals to residuals.png",
+	"task": "Load data.csv, compute summary stats, write report.md",
 	"context": false
 }
 ```
 
+### Command
+
+```text
+/task Load sales.csv, compute monthly revenue by category, write analysis.md
+```
+
 ### Parameters
 
-| Parameter   | Required | Description                                                               |
-| ----------- | -------- | ------------------------------------------------------------------------- |
-| `task`      | Yes      | Self-contained task description with file paths and expected output       |
-| `context`   | No       | Include conversation history from the current pi session (default: false) |
-| `model`     | No       | Override the LLM model (e.g. `anthropic/claude-sonnet-4-5`)               |
-| `functions` | No       | Comma-separated host function modules to load (e.g. `./contrib`)          |
+| Parameter | Required | Description                                                |
+| --------- | -------- | ---------------------------------------------------------- |
+| `task`    | Yes      | Self-contained task description                            |
+| `context` | No       | Include current Pi conversation context (default: `false`) |
 
 ## How it works
 
-Each invocation spawns a fresh `arcgeneral --json` process. The extension:
+For each invocation, the extension spawns `openrlm --json` and:
 
-1. Optionally extracts user/assistant messages from pi's session history
-2. Writes them to a temp file and passes via `--context`
-3. Spawns `arcgeneral --json "<task>"` as a subprocess
-4. Parses the `{"result", "error"}` JSON output
-5. Returns the result to pi (tool) or injects it as a steer message (`/task`)
+1. Optionally writes conversation context to a temporary file and passes `--context`.
+2. Optionally creates a temporary auth bridge when Pi is on a supported OAuth provider.
+3. Streams activity events back into Pi UI.
+4. Returns parsed JSON result output.
+5. Cleans up temporary files.
 
-Abort signals propagate: SIGTERM with 5s grace period, then SIGKILL.
+Abort handling: SIGTERM first, then SIGKILL after a 5-second grace period.
 
 ## License
 

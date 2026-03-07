@@ -1,7 +1,7 @@
 {
-	"name": "arcgeneral-pi",
+	"name": "openrlm-pi",
 	"version": "0.1.0",
-	"description": "Pi extension for arcgeneral — a recursive LLM agent with persistent IPython REPL",
+	"description": "Pi extension for openrlm — a recursive LLM agent with persistent IPython REPL",
 	"keywords": [
 		"pi-package"
 	],
