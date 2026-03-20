@@ -1,6 +1,6 @@
 # openrlm-pi
 
-[Pi](https://github.com/mariozechner/pi-coding-agent) extension for [openrlm](https://github.com/user/openrlm) — a recursive LLM agent with a persistent IPython REPL.
+[Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extension for [openrlm](https://github.com/user/openrlm) — a recursive LLM agent with a persistent IPython REPL.
 
 ## What it provides
 
